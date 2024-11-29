@@ -6,6 +6,6 @@ setup(
     author= 'Sarita Nandal',
     author_email= 'sarita@ma.iitr.ac.in',
     packages= find_packages(),
-    install_requires = []
+    install_requires = [] 
 
 )
