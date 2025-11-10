@@ -1,0 +1,180 @@
+name: Security Scan (SAST + SCA + IaC + DAST)
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Optional target URL for DAST"
+        required: false
+  schedule:
+    - cron: "0 20 * * *"   # nightly (IST evening)
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  issues: write
+
+env:
+  REPORT_DIR: reports
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "$REPORT_DIR"
+
+      - name: Install Semgrep, Pyre, Bandit
+        run: python3 -m pip install --upgrade pip && pip install "semgrep>=1.36.0" pyre-check bandit
+
+      - name: Semgrep scan
+        run: semgrep ci --config p/owasp-top-ten --sarif --output "$REPORT_DIR/semgrep.sarif" || true
+
+      - name: Upload Semgrep SARIF
+        if: ${{ hashFiles('reports/semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/semgrep.sarif
+
+      - name: Gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --report-format sarif --report-path ${{ env.REPORT_DIR }}/gitleaks.sarif
+
+      - name: Upload Gitleaks SARIF
+        if: ${{ hashFiles('reports/gitleaks.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/gitleaks.sarif
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -sSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
+          chmod +x osv-scanner
+
+      - name: OSV-Scanner
+        continue-on-error: true
+        run: ./osv-scanner --format sarif --output "$REPORT_DIR/osv.sarif" .
+
+      - name: Upload OSV SARIF
+        if: ${{ hashFiles('reports/osv.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/osv.sarif
+
+      - name: Build image (optional)
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        continue-on-error: true
+        run: docker build -t app:ci .
+
+      - name: Trivy filesystem/config/image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs,config,rootfs
+          image-ref: app:ci
+          format: sarif
+          output: ${{ env.REPORT_DIR }}/trivy.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload Trivy SARIF
+        if: ${{ hashFiles('reports/trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/trivy.sarif
+
+      - name: Checkov
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: sarif
+          output_file_path: ${{ env.REPORT_DIR }}/checkov.sarif
+          skip_check: CKV_GHA_7
+
+      - name: Upload Checkov SARIF
+        if: ${{ hashFiles('reports/checkov.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/checkov.sarif
+
+      - name: Pyre check
+        if: ${{ hashFiles('.pyre_configuration') != '' || hashFiles('.pyre_configuration.local') != '' }}
+        run: pyre --noninteractive --output=json check 2>&1 | tee ${{ env.REPORT_DIR }}/pyre.json || true
+
+      - name: Upload Pyre findings
+        if: ${{ hashFiles('reports/pyre.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyre.json
+          path: ${{ env.REPORT_DIR }}/pyre.json
+
+      - name: Bandit
+        continue-on-error: true
+        run: bandit -r . -f sarif -o ${{ env.REPORT_DIR }}/bandit.sarif
+
+      - name: Upload Bandit SARIF
+        if: ${{ hashFiles('reports/bandit.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/bandit.sarif
+
+  dast:
+    if: ${{ github.event.inputs.target_url != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      security-events: write
+    steps:
+      - name: ZAP Baseline
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: ${{ github.event.inputs.target_url }}
+          cmd_options: "-a -m 5"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-report
+          path: report_html.html
+
+      - name: ZAP Full Scan
+        continue-on-error: true
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ github.event.inputs.target_url }}
+          allow_issue_writing: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zap-full-report
+          path: report_html.html
+
+      - name: Nuclei - Vulnerability Scan
+        id: nuclei_scan
+        uses: projectdiscovery/nuclei-action@v2.0.1
+        with:
+          target: ${{ github.event.inputs.target_url }}
+          flags: "-severity critical,high,medium -stats"
+          sarif-export: nuclei.sarif
+          output: nuclei.log
+
+      - name: Upload nuclei log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei.log
+          path: nuclei.log
+
+      - name: Upload Nuclei SARIF to GitHub Security
+        if: ${{ steps.nuclei_scan.outputs.sarif_exists == 'true' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: nuclei.sarif
