@@ -135,6 +135,16 @@ jobs:
       issues: write
       security-events: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: ZAP Baseline
         continue-on-error: true
         uses: zaproxy/action-baseline@v0.15.0
@@ -178,3 +188,21 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: nuclei.sarif
+
+      - name: Google Tsunami scan
+        env:
+          TSUNAMI_IMAGE: ${{ vars.TSUNAMI_IMAGE || secrets.TSUNAMI_IMAGE || 'gcr.io/tsunami-images/tsunami:latest' }}
+        run: npx tsx src/scripts/run-tsunami.ts --target ${{ github.event.inputs.target_url }}
+
+      - name: Upload Tsunami artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsunami-results
+          path: reports/tsunami-results.json
+
+      - name: Upload Tsunami SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/tsunami.sarif
