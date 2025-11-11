@@ -1,0 +1,7 @@
+{
+  "source_directories": [
+    "."
+  ],
+  "taint_models_path": [],
+  "ignore_all_errors": []
+}
